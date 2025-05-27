@@ -7,7 +7,6 @@ from Crypto.Random import get_random_bytes
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# DUKPT簡化版（實際應用需HSM與KSN同步）
 class DUKPT:
     def __init__(self, bdk):
         self.bdk = bdk
@@ -60,22 +59,33 @@ class BankServer:
                 payload = self.recv_all(conn, data_len)
                 if not payload or len(payload) < 19:
                     break
-                # 2. 解析KSN、IV、密文
+
+                # 2. 顯示密文（HEX格式）
+                print(f"[Server] 收到密文 (HEX): {payload.hex().upper()}")
+
+                # 3. 解析KSN、IV、密文
                 ksn = payload[:3]
                 iv = payload[3:19]
                 encrypted = payload[19:]
-                # 3. 派生唯一密鑰
+
+                # 4. 派生唯一密鑰並解密
                 pek = self.dukpt.derive_key(ksn)
                 cipher = AES.new(pek, AES.MODE_CBC, iv=iv)
                 try:
-                    data = json.loads(unpad(cipher.decrypt(encrypted), 16).decode())
+                    decrypted = unpad(cipher.decrypt(encrypted), 16)
+                    data = json.loads(decrypted.decode())
+                    print(f"[Server] 解密後明文: {data}")
                 except Exception as e:
-                    print(f"解密失敗: {e}")
+                    print(f"[Server] 解密失敗: {e}")
                     break
-                # 4. 處理請求
+
+                # 5. 處理請求
                 response = self.process_request(data)
+                print(f"[Server] 處理結果: {response}")
+
                 response_json = json.dumps(response).encode()
-                # 5. 每筆回應也用新KSN/PEK
+
+                # 6. 每筆回應也用新KSN/PEK
                 resp_ksn = get_random_bytes(3)
                 resp_pek = self.dukpt.derive_key(resp_ksn)
                 resp_iv = get_random_bytes(16)
@@ -84,6 +94,7 @@ class BankServer:
                 resp_payload = resp_ksn + resp_iv + resp_enc
                 resp_header = len(resp_payload).to_bytes(4, 'big')
                 conn.sendall(resp_header + resp_payload)
+
                 if data.get('type') == 'exit':
                     break
         finally:
@@ -92,10 +103,20 @@ class BankServer:
     def process_request(self, data):
         account = "1001"
         t = data.get('type')
-        if t == 'deposit':
+
+        if t == 'create_account':
+            new_account = data.get('account')
+            if new_account in self.users:
+                return {"success": False, "message": "帳號已存在"}
+            self.users[new_account] = {"balance": 0.0}
+            print(f"[Server] 新增帳號: {new_account}")
+            return {"success": True, "message": f"帳號 {new_account} 創建成功"}
+
+        elif t == 'deposit':
             amt = data.get('amount', 0)
             self.users[account]['balance'] += amt
             return {"success": True, "balance": self.users[account]['balance'], "message": f"存款{amt}元成功"}
+
         elif t == 'withdraw':
             amt = data.get('amount', 0)
             if self.users[account]['balance'] >= amt:
@@ -103,6 +124,7 @@ class BankServer:
                 return {"success": True, "balance": self.users[account]['balance']}
             else:
                 return {"success": False, "message": "餘額不足"}
+
         elif t == 'transfer':
             target = data.get('target')
             amt = data.get('amount', 0)
@@ -114,10 +136,13 @@ class BankServer:
                 return {"success": True, "balance": self.users[account]['balance']}
             else:
                 return {"success": False, "message": "餘額不足"}
+
         elif t == 'balance':
             return {"success": True, "balance": self.users[account]['balance']}
+
         elif t == 'exit':
             return {"success": True, "message": "已登出"}
+
         else:
             return {"success": False, "message": "未知操作"}
 

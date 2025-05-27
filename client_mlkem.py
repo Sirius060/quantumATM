@@ -64,6 +64,7 @@ class ATMClientGUI:
         ttk.Button(btn_frame, text="取款", width=8, command=self.show_withdraw).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="轉賬", width=8, command=self.show_transfer).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="查餘額", width=8, command=self.query_balance).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="創建帳號", width=8, command=self.show_create_account).pack(side=tk.LEFT, padx=5)  # 新增按鈕
         btn_frame.pack(pady=10)
         self.log = tk.Text(self.main_frame, height=8, width=52, state="disabled")
         self.log.pack(pady=10)
@@ -166,6 +167,24 @@ class ATMClientGUI:
                 messagebox.showerror("錯誤", "請輸入有效帳號與金額")
         ttk.Button(win, text="確認", command=submit).pack(pady=10)
 
+    def show_create_account(self):  # 新增彈出視窗
+        win = tk.Toplevel(self.root)
+        win.title("創建帳號")
+        ttk.Label(win, text="新帳號:").pack(pady=5)
+        account_entry = ttk.Entry(win)
+        account_entry.pack(pady=5)
+        account_entry.focus_set()
+        def submit():
+            try:
+                account = account_entry.get()
+                if not account:
+                    raise ValueError
+                win.destroy()
+                threading.Thread(target=self.create_account, args=(account,), daemon=True).start()
+            except:
+                messagebox.showerror("錯誤", "請輸入有效帳號")
+        ttk.Button(win, text="確認", command=submit).pack(pady=10)
+
     def _show_amount_dialog(self, label, action):
         win = tk.Toplevel(self.root)
         win.title(label)
@@ -219,6 +238,17 @@ class ATMClientGUI:
                 self.log_message(f"轉賬失敗：{response.get('message')}")
         except Exception as e:
             self.log_message(f"轉賬異常: {e}")
+
+    def create_account(self, account):  # 新增創建帳號方法
+        try:
+            self._encrypt_send({'type': 'create_account', 'account': account})
+            response = self._decrypt_receive()
+            if response.get('success'):
+                self.log_message(f"帳號 {account} 創建成功")
+            else:
+                self.log_message(f"創建帳號失敗：{response.get('message')}")
+        except Exception as e:
+            self.log_message(f"創建帳號異常: {e}")
 
     def query_balance(self):
         try:

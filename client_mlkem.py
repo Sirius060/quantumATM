@@ -1,4 +1,3 @@
-# client_mlkem_final.py
 import socket
 import json
 import threading

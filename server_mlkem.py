@@ -1,3 +1,4 @@
+# server_mlkem_final.py
 import socket
 import json
 import threading
@@ -13,8 +14,8 @@ from datetime import datetime
 class QuantumBankServer:
     def __init__(self):
         self.accounts = {
-            '1001': {'balance': 100000.0},  # 原帳號
-            '1002': {'balance': 50000.0},   # 新增轉帳用帳號
+            '1001': {'balance': 100000.0},
+            '1002': {'balance': 50000.0}
         }
         self.active_sessions = {}
         self.server_sig_pk, self.server_sig_sk = Dilithium2.keygen()
@@ -36,6 +37,7 @@ class QuantumBankServer:
             ek = self._recv_all(conn, ek_len)
             
             session_key, ct = ML_KEM_768.encaps(ek)
+            print(f"[伺服器] 生成密文長度: {len(ct)} bytes")
             conn.sendall(len(ct).to_bytes(2, 'big') + ct)
             
             hkdf = HKDF(
@@ -49,6 +51,7 @@ class QuantumBankServer:
             sig_pk_len = int.from_bytes(self._recv_all(conn, 2), 'big')
             sig_pk_encoded = self._recv_all(conn, sig_pk_len)
             sig_pk = base64.b64decode(sig_pk_encoded)
+            print(f"[伺服器] 接收簽章公鑰長度: {len(sig_pk_encoded)} bytes")
             
             self.active_sessions[conn] = {
                 'key': session_key,
@@ -63,7 +66,8 @@ class QuantumBankServer:
                 payload = self._recv_all(conn, int.from_bytes(header, 'big'))
                 decrypted = self._quantum_decrypt(payload, session_key, conn)
                 response = self._process_request(decrypted)
-                self._send_response(conn, response, session_key)
+                encrypted_response = self._send_response(conn, response, session_key)
+                print(f"[伺服器] 加密響應長度: {len(encrypted_response)} bytes")
 
         except Exception as e:
             print(f"[{datetime.now().isoformat()}] 客戶端處理異常: {str(e)}")
@@ -129,7 +133,6 @@ class QuantumBankServer:
         target = data.get('target')
         amount = float(data.get('amount', 0))
         
-        # 強化帳號存在性檢查
         if target not in self.accounts:
             return {
                 "success": False,
@@ -138,12 +141,10 @@ class QuantumBankServer:
             }
             
         try:
-            # 強化金額驗證
             if amount <= 0:
                 raise ValueError("轉帳金額需大於零")
                 
             if self.accounts[account]['balance'] >= amount:
-                # 原子操作保證數據一致性
                 self.accounts[account]['balance'] -= amount
                 self.accounts[target]['balance'] += amount
                 return {
@@ -219,6 +220,7 @@ class QuantumBankServer:
         ciphertext, tag = cipher.encrypt_and_digest(json.dumps(payload).encode())
         full_payload = nonce + tag + ciphertext
         conn.sendall(len(full_payload).to_bytes(4, 'big') + full_payload)
+        return full_payload
 
     def _recv_all(self, conn, length):
         data = bytearray()

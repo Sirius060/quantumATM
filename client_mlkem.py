@@ -1,276 +1,440 @@
+# client_mlkem_final.py
 import socket
-import ssl
 import json
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from Crypto.Random import get_random_bytes
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-import threading
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from kyber_py.ml_kem import ML_KEM_768
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from dilithium_py.dilithium import Dilithium2
+from datetime import datetime
+import base64
+import time
 
-class DUKPT:
-    def __init__(self, bdk):
-        self.bdk = bdk
-        self.counter = 0
-
-    def next_ksn(self):
-        self.counter += 1
-        return self.counter.to_bytes(3, 'big')
-
-    def derive_key(self, ksn):
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=ksn,
-            iterations=10000,
-        )
-        return kdf.derive(self.bdk)
-
-class ATMClientGUI:
+class QuantumATMClient:
     def __init__(self):
-        self.bdk = b'bankdemo1234567890bankdemo1234567' # 32 bytes
-        self.dukpt = DUKPT(self.bdk)
         self.sock = None
-
+        self.session_key = None
+        self.dilithium_class = Dilithium2
+        self.sig_pk, self.sig_sk = self.dilithium_class.keygen()
         self.root = tk.Tk()
-        self.root.title("量子安全ATM系統 (TLS 1.3 + DUKPT)")
-        self.root.geometry("420x350")
+        self.root.title("🛡️ 量子安全ATM系統")
+        self.root.geometry("600x700")
+        self.lock = threading.Lock()
+        self.retry_count = 0
+        self.max_retries = 3
+        self.last_balance = 0.0
+        self._setup_styles()
+        self._setup_interface()
 
-        self.create_connect_frame()
-        self.create_main_frame()
-        self.show_connect_frame()
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Title.TLabel', font=('Arial', 20, 'bold'), foreground='#2c3e50')
+        style.configure('Balance.TLabel', font=('Arial', 24, 'bold'), foreground='#27ae60')
+        style.configure('Status.TLabel', font=('Arial', 10), foreground='#7f8c8d')
+        style.configure('Action.TButton', font=('Arial', 12, 'bold'), padding=10)
 
-    def create_connect_frame(self):
-        self.connect_frame = ttk.Frame(self.root)
-        ttk.Label(self.connect_frame, text="伺服器IP:").grid(row=0, column=0, padx=5, pady=10)
-        self.ip_entry = ttk.Entry(self.connect_frame)
+    def _setup_interface(self):
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill='both', expand=True, padx=20, pady=20)
+
+        title_frame = ttk.Frame(main_container)
+        title_frame.pack(fill='x', pady=(0, 20))
+        ttk.Label(title_frame, text="🛡️ 量子安全ATM系統", style='Title.TLabel').pack()
+        ttk.Label(title_frame, text="Post-Quantum Cryptography Secure Banking", 
+                 font=('Arial', 10), foreground='#95a5a6').pack()
+
+        self.connect_frame = ttk.LabelFrame(main_container, text="🔗 伺服器連線", padding=15)
+        self.connect_frame.pack(fill='x', pady=(0, 20))
+        
+        conn_inner = ttk.Frame(self.connect_frame)
+        conn_inner.pack()
+        
+        ttk.Label(conn_inner, text="伺服器IP:", font=('Arial', 11)).grid(row=0, column=0, sticky='e', padx=(0, 10))
+        self.ip_entry = ttk.Entry(conn_inner, width=20, font=('Arial', 11))
         self.ip_entry.insert(0, "localhost")
-        self.ip_entry.grid(row=0, column=1, padx=5, pady=10)
-        ttk.Label(self.connect_frame, text="埠號:").grid(row=1, column=0, padx=5, pady=5)
-        self.port_entry = ttk.Entry(self.connect_frame)
-        self.port_entry.insert(0, "5000")
-        self.port_entry.grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(self.connect_frame, text="連線", command=self.connect_server).grid(row=2, column=0, columnspan=2, pady=15)
+        self.ip_entry.grid(row=0, column=1, padx=(0, 10))
+        
+        self.connect_btn = ttk.Button(conn_inner, text="🔐 建立量子安全連線", 
+                                    command=self._start_handshake, style='Action.TButton')
+        self.connect_btn.grid(row=0, column=2)
 
-    def create_main_frame(self):
-        self.main_frame = ttk.Frame(self.root)
+        self.main_frame = ttk.Frame(main_container)
+        self._build_transaction_ui()
+
+        self.status_frame = ttk.Frame(main_container)
+        self.status_frame.pack(fill='x', side='bottom', pady=(20, 0))
+        ttk.Separator(self.status_frame, orient='horizontal').pack(fill='x', pady=(0, 5))
+        self.status_var = tk.StringVar(value="🔴 未連線 - 等待建立量子安全通道")
+        ttk.Label(self.status_frame, textvariable=self.status_var, style='Status.TLabel').pack(side='left')
+        self.time_var = tk.StringVar()
+        ttk.Label(self.status_frame, textvariable=self.time_var, style='Status.TLabel').pack(side='right')
+        self._update_time()
+
+    def _build_transaction_ui(self):
+        account_frame = ttk.LabelFrame(self.main_frame, text="💰 帳戶資訊", padding=20)
+        account_frame.pack(fill='x', pady=(0, 20))
         self.balance_var = tk.StringVar(value="--")
-        ttk.Label(self.main_frame, text="當前餘額:").pack(pady=5)
-        self.balance_label = ttk.Label(self.main_frame, textvariable=self.balance_var, font=("Arial", 16))
-        self.balance_label.pack(pady=5)
-        btn_frame = ttk.Frame(self.main_frame)
-        ttk.Button(btn_frame, text="存款", width=8, command=self.show_deposit).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="取款", width=8, command=self.show_withdraw).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="轉賬", width=8, command=self.show_transfer).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="查餘額", width=8, command=self.query_balance).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="創建帳號", width=8, command=self.show_create_account).pack(side=tk.LEFT, padx=5)
-        btn_frame.pack(pady=10)
-        self.log = tk.Text(self.main_frame, height=8, width=52, state="disabled")
-        self.log.pack(pady=10)
-        ttk.Button(self.main_frame, text="退出", command=self.exit).pack()
+        ttk.Label(account_frame, text="即時餘額:", font=('Arial', 14)).pack()
+        ttk.Label(account_frame, textvariable=self.balance_var, style='Balance.TLabel').pack(pady=10)
 
-    def show_connect_frame(self):
-        self.main_frame.pack_forget()
-        self.connect_frame.pack(expand=True)
+        transaction_frame = ttk.LabelFrame(self.main_frame, text="🔧 交易操作", padding=20)
+        transaction_frame.pack(fill='x', pady=(0, 20))
+        btn_container = ttk.Frame(transaction_frame)
+        btn_container.pack()
+        
+        buttons = [
+            ("💰 存款", self._deposit),
+            ("💸 取款", self._withdraw),
+            ("🔄 轉賬", self._transfer),
+            ("📊 查詢餘額", self._execute_query_balance)
+        ]
+        
+        for i, (text, cmd) in enumerate(buttons):
+            row = i // 2
+            col = i % 2
+            btn = ttk.Button(btn_container, text=text, command=cmd, 
+                           style='Action.TButton', width=15)
+            btn.grid(row=row, column=col, padx=10, pady=10)
 
-    def show_main_frame(self):
-        self.connect_frame.pack_forget()
-        self.main_frame.pack(expand=True, fill=tk.BOTH)
-        self.log_message("連線成功，已建立安全通道。")
-        self.query_balance()
+        log_frame = ttk.LabelFrame(self.main_frame, text="📋 交易記錄", padding=10)
+        log_frame.pack(fill='both', expand=True)
+        log_scroll_frame = ttk.Frame(log_frame)
+        log_scroll_frame.pack(fill='both', expand=True)
+        self.log_text = tk.Text(log_scroll_frame, height=8, wrap='word', 
+                               font=('Consolas', 9), state='disabled')
+        log_scrollbar = ttk.Scrollbar(log_scroll_frame, orient='vertical', 
+                                     command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side='left', fill='both', expand=True)
+        log_scrollbar.pack(side='right', fill='y')
 
-    def connect_server(self):
-        host = self.ip_entry.get()
+    def _start_handshake(self):
+        self.connect_btn.configure(state='disabled', text="🔄 連線中...")
+        self._update_status("🟡 正在建立量子安全通道...")
+        threading.Thread(target=self._perform_handshake, daemon=True).start()
+
+    def _perform_handshake(self):
         try:
-            port = int(self.port_entry.get())
-        except ValueError:
-            messagebox.showerror("錯誤", "請輸入正確的埠號")
-            return
-        threading.Thread(target=self._connect_server, args=(host, port), daemon=True).start()
+            with self.lock:
+                if self.retry_count >= self.max_retries:
+                    raise ConnectionError("❌ 超過最大重試次數")
 
-    def _connect_server(self, host, port):
-        try:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.load_verify_locations('cert.pem')
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_REQUIRED
-            plain_sock = socket.socket()
-            self.sock = context.wrap_socket(plain_sock, server_hostname=host)
-            self.sock.connect((host, port))
-            self.root.after(0, self.show_main_frame)
+                if self.sock:
+                    self.sock.close()
+                self.sock = socket.create_connection(
+                    (self.ip_entry.get(), 5000), 
+                    timeout=10
+                )
+                
+                self.ek, self.dk = ML_KEM_768.keygen()
+                self.sock.sendall(len(self.ek).to_bytes(2, 'big') + self.ek)
+                
+                ct_len_bytes = self._recv_all(2)
+                ct_len = int.from_bytes(ct_len_bytes, 'big')
+                ct = self._recv_all(ct_len)
+                
+                if len(ct) != 1088:
+                    raise ValueError(f"密文長度異常: 預期 1088 bytes, 實際 {len(ct)} bytes")
+                
+                self.session_key = ML_KEM_768.decaps(self.dk, ct)
+                
+                sig_pk_b64 = base64.b64encode(self.sig_pk).decode()
+                self.sock.sendall(len(sig_pk_b64).to_bytes(2, 'big') + sig_pk_b64.encode())
+                
+                hkdf = HKDF(
+                    algorithm=hashes.SHA384(),
+                    length=32,
+                    salt=None,
+                    info=b'quantum-banking'
+                )
+                self.session_key = hkdf.derive(self.session_key)
+                
+                self.retry_count = 0
+                self.root.after(0, self._on_connection_success)
+
         except Exception as e:
-            self.sock = None
-            self.root.after(0, lambda: messagebox.showerror("連線失敗", str(e)))
+            error_msg = str(e)
+            self.root.after(0, lambda: self._on_connection_failed(error_msg))
 
     def _encrypt_send(self, data):
-        ksn = self.dukpt.next_ksn()
-        pek = self.dukpt.derive_key(ksn)
-        iv = get_random_bytes(16)
-        cipher = AES.new(pek, AES.MODE_CBC, iv=iv)
-        encrypted = cipher.encrypt(pad(json.dumps(data).encode(), 16))
-        payload = ksn + iv + encrypted
-        header = len(payload).to_bytes(4, 'big')
-        self.sock.sendall(header + payload)
+        with self.lock:
+            try:
+                key = HKDF(
+                    algorithm=hashes.SHA384(),
+                    length=32,
+                    salt=None,
+                    info=b'quantum-banking'
+                ).derive(self.session_key)
+                
+                nonce = get_random_bytes(12)
+                signature = self.dilithium_class.sign(self.sig_sk, json.dumps(data).encode())
+                signed_data = {
+                    'data': data,
+                    'sig': signature.hex(),
+                    'params': (self.dilithium_class.k, self.dilithium_class.l)
+                }
+                
+                cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                ciphertext, tag = cipher.encrypt_and_digest(json.dumps(signed_data).encode())
+                payload = nonce + tag + ciphertext
+                self.sock.sendall(len(payload).to_bytes(4, 'big') + payload)
+            except Exception as e:
+                self._log(f"發送失敗: {str(e)}", "error")
 
     def _decrypt_receive(self):
-        header = self.sock.recv(4)
-        data_len = int.from_bytes(header, 'big')
-        payload = b''
-        while len(payload) < data_len:
-            chunk = self.sock.recv(data_len - len(payload))
-            if not chunk:
-                raise ConnectionError("連線中斷")
-            payload += chunk
-        ksn = payload[:3]
-        iv = payload[3:19]
-        encrypted = payload[19:]
-        pek = self.dukpt.derive_key(ksn)
-        cipher = AES.new(pek, AES.MODE_CBC, iv=iv)
+        with self.lock:
+            try:
+                header = self._recv_all(4)
+                if not header:
+                    return None
+                payload_len = int.from_bytes(header, 'big')
+                payload = self._recv_all(payload_len)
+                
+                if len(payload) < 28:
+                    raise ValueError(f"封包長度不足: {len(payload)} bytes")
+                
+                nonce = payload[:12]
+                tag = payload[12:28]
+                ciphertext = payload[28:]
+                
+                key = HKDF(
+                    algorithm=hashes.SHA384(),
+                    length=32,
+                    salt=None,
+                    info=b'quantum-banking'
+                ).derive(self.session_key)
+                
+                cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+                response = json.loads(plaintext.decode())
+                
+                if not isinstance(response, dict) or 'data' not in response:
+                    raise ValueError("無效響應格式")
+                return response['data']
+                
+            except json.JSONDecodeError as e:
+                self._log(f"JSON解析失敗: {str(e)}", "error")
+            except ValueError as e:
+                self._log(f"解密失敗: {str(e)}", "error")
+            except Exception as e:
+                self._log(f"接收異常: {str(e)}", "critical")
+            return None
+
+    def _recv_all(self, length):
+        data = bytearray()
+        while len(data) < length:
+            try:
+                chunk = self.sock.recv(min(4096, length - len(data)))
+                if not chunk:
+                    raise ConnectionAbortedError("連線已中斷")
+                data.extend(chunk)
+            except ConnectionResetError:
+                raise ConnectionAbortedError("連線被重置")
+        return bytes(data)
+
+    def _update_balance(self, response):
         try:
-            decrypted = unpad(cipher.decrypt(encrypted), 16)
-            return json.loads(decrypted.decode())
+            if response is None:
+                self.balance_var.set(f"{self.last_balance:,.2f} 元 (連線異常)")
+                return
+                
+            required_keys = {'success', 'balance', 'message'}
+            if not all(key in response for key in required_keys):
+                missing = required_keys - response.keys()
+                raise ValueError(f"缺少必要字段: {missing}")
+            
+            if not isinstance(response['success'], bool):
+                raise TypeError("success 字段類型錯誤")
+                
+            balance = response['balance']
+            if not isinstance(balance, (int, float)):
+                raise TypeError("balance 字段類型錯誤")
+                
+            self.last_balance = balance
+            formatted_balance = f"{balance:,.2f} 元"
+            self.balance_var.set(formatted_balance)
+            
+            if response['success']:
+                messagebox.showinfo("交易成功", 
+                    f"{response['message']}\n最新餘額: {formatted_balance}")
+            else:
+                messagebox.showerror("交易失敗", 
+                    f"{response['message']}\n當前餘額: {formatted_balance}")
+            
+            self.root.update_idletasks()
+            
         except Exception as e:
-            self.log_message(f"解密失敗: {e}")
-            return {"success": False, "message": "解密失敗"}
+            self.balance_var.set(f"{self.last_balance:,.2f} 元 (更新失敗)")
+            self._log(f"餘額更新異常: {str(e)}", "error")
+            messagebox.showerror("系統錯誤", "無法解析伺服器響應")
 
-    def log_message(self, msg):
-        self.log.config(state="normal")
-        self.log.insert(tk.END, msg + "\n")
-        self.log.see(tk.END)
-        self.log.config(state="disabled")
+    def _execute_query_balance(self):
+        try:
+            if not self._check_connection():
+                return
+                
+            start_time = time.time()
+            self._encrypt_send({'type': 'balance', 'account': '1001'})
+            response = self._decrypt_receive()
+            
+            if time.time() - start_time > 5:
+                raise TimeoutError("伺服器響應超時")
+                
+            self._update_balance(response)
+            
+        except TimeoutError as e:
+            self._log(f"❌ {str(e)}", "error")
+            self.balance_var.set(f"{self.last_balance:,.2f} 元 (超時)")
+        except Exception as e:
+            self._log(f"❌ 查詢失敗: {str(e)}", "error")
 
-    def show_deposit(self):
-        self._show_amount_dialog("存款金額", self.deposit)
+    def _check_connection(self):
+        if self.sock is None or self.sock.fileno() == -1:
+            self._log("未建立有效連線", "error")
+            messagebox.showerror("錯誤", "請先建立伺服器連線")
+            return False
+        return True
 
-    def show_withdraw(self):
-        self._show_amount_dialog("取款金額", self.withdraw)
+    def _log(self, message, level="info"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        level_prefix = {
+            "info": "ℹ️",
+            "success": "✅", 
+            "warning": "⚠️",
+            "error": "❌"
+        }.get(level, "📝")
+        log_entry = f"[{timestamp}] {level_prefix} {message}"
+        
+        self.log_text.configure(state='normal')
+        self.log_text.insert(tk.END, f"{log_entry}\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state='disabled')
+        print(log_entry)
 
-    def show_transfer(self):
-        win = tk.Toplevel(self.root)
-        win.title("轉賬")
-        ttk.Label(win, text="對方帳號:").pack(pady=5)
-        target_entry = ttk.Entry(win)
-        target_entry.pack(pady=5)
-        ttk.Label(win, text="轉賬金額:").pack(pady=5)
-        amount_entry = ttk.Entry(win)
-        amount_entry.pack(pady=5)
-        def submit():
+    def _update_status(self, status):
+        self.status_var.set(status)
+
+    def _update_time(self):
+        self.time_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.root.after(1000, self._update_time)
+
+    def _on_connection_success(self):
+        self.connect_frame.pack_forget()
+        self.main_frame.pack(fill='both', expand=True)
+        self._update_status("🟢 已連線 - 量子安全通道已建立")
+        self._execute_query_balance()
+
+    def _on_connection_failed(self, error):
+        self.connect_btn.configure(state='normal', text="🔐 建立量子安全連線")
+        self._update_status("🔴 連線失敗")
+        messagebox.showerror("連線失敗", f"錯誤原因：{error}")
+
+    def _deposit(self):
+        self._show_amount_dialog("存款", self._execute_deposit)
+
+    def _withdraw(self):
+        self._show_amount_dialog("取款", self._execute_withdraw)
+
+    def _transfer(self):
+        self._show_transfer_dialog()
+
+    def _show_amount_dialog(self, action, callback):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(action)
+        ttk.Label(dialog, text="金額:").pack(side=tk.LEFT)
+        amount_entry = ttk.Entry(dialog)
+        amount_entry.pack(side=tk.LEFT)
+        
+        def on_confirm():
+            try:
+                amount = float(amount_entry.get())
+                if amount <= 0:
+                    raise ValueError("金額需大於零")
+                dialog.destroy()
+                callback(amount)
+            except ValueError as e:
+                messagebox.showerror("輸入錯誤", str(e))
+        
+        ttk.Button(dialog, text="確認", command=on_confirm).pack(side=tk.LEFT)
+
+    def _show_transfer_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("轉賬")
+        ttk.Label(dialog, text="目標帳號:").grid(row=0, column=0)
+        target_entry = ttk.Entry(dialog)
+        target_entry.grid(row=0, column=1)
+        ttk.Label(dialog, text="金額:").grid(row=1, column=0)
+        amount_entry = ttk.Entry(dialog)
+        amount_entry.grid(row=1, column=1)
+        
+        def on_confirm():
             try:
                 target = target_entry.get()
+                if not target:
+                    raise ValueError("目標帳號不能為空")
                 amount = float(amount_entry.get())
                 if amount <= 0:
-                    raise ValueError
-                win.destroy()
-                threading.Thread(target=self.transfer, args=(target, amount), daemon=True).start()
-            except:
-                messagebox.showerror("錯誤", "請輸入有效帳號與金額")
-        ttk.Button(win, text="確認", command=submit).pack(pady=10)
+                    raise ValueError("轉帳金額需大於零")
+                dialog.destroy()
+                self._execute_transfer(target, amount)
+            except ValueError as e:
+                messagebox.showerror("輸入錯誤", str(e))
+        
+        ttk.Button(dialog, text="確認", command=on_confirm).grid(row=2, columnspan=2)
 
-    def show_create_account(self):
-        win = tk.Toplevel(self.root)
-        win.title("創建帳號")
-        ttk.Label(win, text="新帳號:").pack(pady=5)
-        account_entry = ttk.Entry(win)
-        account_entry.pack(pady=5)
-        account_entry.focus_set()
-        def submit():
-            try:
-                account = account_entry.get()
-                if not account:
-                    raise ValueError
-                win.destroy()
-                threading.Thread(target=self.create_account, args=(account,), daemon=True).start()
-            except:
-                messagebox.showerror("錯誤", "請輸入有效帳號")
-        ttk.Button(win, text="確認", command=submit).pack(pady=10)
-
-    def _show_amount_dialog(self, label, action):
-        win = tk.Toplevel(self.root)
-        win.title(label)
-        ttk.Label(win, text=label + ":").pack(pady=5)
-        amount_entry = ttk.Entry(win)
-        amount_entry.pack(pady=5)
-        amount_entry.focus_set()
-        def submit():
-            try:
-                amount = float(amount_entry.get())
-                if amount <= 0:
-                    raise ValueError
-                win.destroy()
-                threading.Thread(target=action, args=(amount,), daemon=True).start()
-            except:
-                messagebox.showerror("錯誤", "請輸入有效正數金額")
-        ttk.Button(win, text="確認", command=submit).pack(pady=10)
-
-    def deposit(self, amount):
+    def _execute_deposit(self, amount):
         try:
-            self._encrypt_send({'type': 'deposit', 'amount': amount})
+            self._encrypt_send({'type': 'deposit', 'amount': amount, 'account': '1001'})
             response = self._decrypt_receive()
-            if response.get('success'):
-                self.log_message(f"存款{amount}元成功。餘額：{response.get('balance')}")
-                self.balance_var.set(str(response.get('balance')))
-            else:
-                self.log_message(f"存款失敗：{response.get('message')}")
+            self._update_balance(response)
+            self._log(f"💰 存款成功: +{amount:.2f}元", "success")
         except Exception as e:
-            self.log_message(f"存款異常: {e}")
+            self._log(f"❌ 存款失敗: {str(e)}", "error")
 
-    def withdraw(self, amount):
+    def _execute_withdraw(self, amount):
         try:
-            self._encrypt_send({'type': 'withdraw', 'amount': amount})
+            self._encrypt_send({'type': 'withdraw', 'amount': amount, 'account': '1001'})
             response = self._decrypt_receive()
-            if response.get('success'):
-                self.log_message(f"取款{amount}元成功。餘額：{response.get('balance')}")
-                self.balance_var.set(str(response.get('balance')))
-            else:
-                self.log_message(f"取款失敗：{response.get('message')}")
+            self._update_balance(response)
+            self._log(f"💸 取款成功: -{amount:.2f}元", "success")
         except Exception as e:
-            self.log_message(f"取款異常: {e}")
+            self._log(f"❌ 取款失敗: {str(e)}", "error")
 
-    def transfer(self, target, amount):
+    def _execute_transfer(self, target, amount):
         try:
-            self._encrypt_send({'type': 'transfer', 'target': target, 'amount': amount})
+            self._encrypt_send({
+                'type': 'transfer',
+                'target': target,
+                'amount': amount,
+                'account': '1001'
+            })
+            
+            start_time = time.time()
             response = self._decrypt_receive()
+            
+            if time.time() - start_time > 5:
+                raise TimeoutError("伺服器響應超時")
+                
+            self._update_balance(response)
+            
             if response.get('success'):
-                self.log_message(f"已成功轉賬{amount}元至{target}。餘額：{response.get('balance')}")
-                self.balance_var.set(str(response.get('balance')))
+                self._log(f"🔄 轉賬成功: 向{target}轉出{amount:.2f}元", "success")
             else:
-                self.log_message(f"轉賬失敗：{response.get('message')}")
+                self._log(f"❌ 轉賬失敗: {response.get('message')}", "error")
+                
+        except ValueError as e:
+            messagebox.showerror("輸入錯誤", str(e))
+        except TimeoutError as e:
+            self._log(f"❌ 轉帳超時: {str(e)}", "error")
+            messagebox.showerror("錯誤", "交易逾時，請檢查網路連線")
         except Exception as e:
-            self.log_message(f"轉賬異常: {e}")
-
-    def create_account(self, account):
-        try:
-            self._encrypt_send({'type': 'create_account', 'account': account})
-            response = self._decrypt_receive()
-            if response.get('success'):
-                self.log_message(f"帳號 {account} 創建成功")
-            else:
-                self.log_message(f"創建帳號失敗：{response.get('message')}")
-        except Exception as e:
-            self.log_message(f"創建帳號異常: {e}")
-
-    def query_balance(self):
-        try:
-            self._encrypt_send({'type': 'balance'})
-            response = self._decrypt_receive()
-            if response.get('success'):
-                self.balance_var.set(str(response.get('balance')))
-                self.log_message(f"查詢餘額：{response.get('balance')}元")
-            else:
-                self.log_message(f"查詢餘額失敗：{response.get('message')}")
-        except Exception as e:
-            self.log_message(f"查詢餘額異常: {e}")
-
-    def exit(self):
-        try:
-            self._encrypt_send({'type': 'exit'})
-        except:
-            pass
-        if self.sock:
-            self.sock.close()
-        self.root.destroy()
+            self._log(f"❌ 轉帳異常: {str(e)}", "error")
+            messagebox.showerror("錯誤", "交易處理發生未知錯誤")
 
 if __name__ == "__main__":
-    ATMClientGUI().root.mainloop()
+    QuantumATMClient().root.mainloop()

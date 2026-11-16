@@ -1,235 +1,259 @@
-# server_mlkem_final.py
+"""
+quantumATM 銀行核心伺服器
+
+    python server_mlkem.py [--host 0.0.0.0] [--port 5000]
+
+第一次啟動會產生長期 ML-DSA-65 身分金鑰 server_identity.key（請勿上傳 Git），
+並印出公鑰指紋，供 ATM 端比對。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import logging
+import os
 import socket
-import json
+import socketserver
 import threading
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
-from kyber_py.ml_kem import ML_KEM_768
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from dilithium_py.dilithium import Dilithium2
-import base64
-from datetime import datetime
+import time
+from decimal import Decimal, InvalidOperation
 
-class QuantumBankServer:
+from protocol import (
+    DEFAULT_PORT,
+    ProtocolError,
+    SecureChannel,
+    ServerIdentity,
+    fingerprint,
+    server_handshake,
+)
+
+log = logging.getLogger("quantum-bank")
+
+CENT = Decimal("0.01")
+MAX_TX_AMOUNT = Decimal("1000000")   # 單筆上限
+MAX_PIN_ATTEMPTS = 3
+IDLE_TIMEOUT = 120                   # 秒；閒置連線自動斷開
+
+
+# ---------------------------------------------------------------- bank state
+def _hash_pin(pin: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(pin.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+
+
+class Account:
+    def __init__(self, number: str, balance: str, pin: str):
+        self.number = number
+        self.balance = Decimal(balance)
+        self.salt = os.urandom(16)
+        self.pin_hash = _hash_pin(pin, self.salt)
+        self.failed_attempts = 0
+        self.lock = threading.Lock()
+
+    def check_pin(self, pin: str) -> bool:
+        return hmac.compare_digest(_hash_pin(pin, self.salt), self.pin_hash)
+
+
+class Bank:
+    """所有帳務操作都在帳戶鎖內完成，避免多執行緒競爭造成餘額錯誤。"""
+
     def __init__(self):
+        # 示範帳戶（帳號, 初始餘額, PIN）
         self.accounts = {
-            '1001': {'balance': 100000.0},
-            '1002': {'balance': 50000.0}
-        }
-        self.active_sessions = {}
-        self.server_sig_pk, self.server_sig_sk = Dilithium2.keygen()
-
-    def start(self, host='0.0.0.0', port=5000):
-        with socket.socket() as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((host, port))
-            sock.listen(5)
-            print(f"量子銀行核心系統啟動 @ {host}:{port}")
-            while True:
-                conn, addr = sock.accept()
-                threading.Thread(target=self._handle_client, args=(conn,)).start()
-
-    def _handle_client(self, conn):
-        try:
-            ek_len_bytes = self._recv_all(conn, 2)
-            ek_len = int.from_bytes(ek_len_bytes, 'big')
-            ek = self._recv_all(conn, ek_len)
-            
-            session_key, ct = ML_KEM_768.encaps(ek)
-            print(f"[伺服器] 生成密文長度: {len(ct)} bytes")
-            conn.sendall(len(ct).to_bytes(2, 'big') + ct)
-            
-            hkdf = HKDF(
-                algorithm=hashes.SHA384(),
-                length=32,
-                salt=None,
-                info=b'quantum-banking'
+            a.number: a
+            for a in (
+                Account("1001", "100000.00", "1234"),
+                Account("1002", "50000.00", "5678"),
             )
-            session_key = hkdf.derive(session_key)
-            
-            sig_pk_len = int.from_bytes(self._recv_all(conn, 2), 'big')
-            sig_pk_encoded = self._recv_all(conn, sig_pk_len)
-            sig_pk = base64.b64decode(sig_pk_encoded)
-            print(f"[伺服器] 接收簽章公鑰長度: {len(sig_pk_encoded)} bytes")
-            
-            self.active_sessions[conn] = {
-                'key': session_key,
-                'sig_pk': sig_pk,
-                'dilithium_ver': Dilithium2
-            }
-
-            while True:
-                header = self._recv_all(conn, 4)
-                if not header:
-                    break
-                payload = self._recv_all(conn, int.from_bytes(header, 'big'))
-                decrypted = self._quantum_decrypt(payload, session_key, conn)
-                response = self._process_request(decrypted)
-                encrypted_response = self._send_response(conn, response, session_key)
-                print(f"[伺服器] 加密響應長度: {len(encrypted_response)} bytes")
-
-        except Exception as e:
-            print(f"[{datetime.now().isoformat()}] 客戶端處理異常: {str(e)}")
-        finally:
-            conn.close()
-            self.active_sessions.pop(conn, None)
-
-    def _process_request(self, data):
-        try:
-            req_type = data.get('type')
-            account = data.get('account', '1001')
-            
-            if account not in self.accounts:
-                self.accounts[account] = {'balance': 0.0}
-                
-            if req_type == 'deposit':
-                return self._handle_deposit(data, account)
-            elif req_type == 'withdraw':
-                return self._handle_withdraw(data, account)
-            elif req_type == 'transfer':
-                return self._handle_transfer(data, account)
-            elif req_type == 'balance':
-                return self._handle_balance(account)
-            else:
-                return {
-                    "success": False,
-                    "message": "無效操作類型",
-                    "balance": self.accounts[account]['balance']
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"伺服器錯誤: {str(e)}",
-                "balance": self.accounts[account].get('balance', 0.0)
-            }
-
-    def _handle_deposit(self, data, account):
-        amount = float(data.get('amount', 0))
-        self.accounts[account]['balance'] += amount
-        return {
-            "success": True,
-            "balance": self.accounts[account]['balance'],
-            "message": f"成功存入 {amount:.2f} 元"
         }
 
-    def _handle_withdraw(self, data, account):
-        amount = float(data.get('amount', 0))
-        if self.accounts[account]['balance'] >= amount:
-            self.accounts[account]['balance'] -= amount
-            return {
-                "success": True,
-                "balance": self.accounts[account]['balance'],
-                "message": f"成功取出 {amount:.2f} 元"
-            }
-        else:
-            return {
-                "success": False,
-                "message": "餘額不足",
-                "balance": self.accounts[account]['balance']
-            }
-
-    def _handle_transfer(self, data, account):
-        target = data.get('target')
-        amount = float(data.get('amount', 0))
-        
-        if target not in self.accounts:
-            return {
-                "success": False,
-                "message": f"目標帳號 {target} 不存在",
-                "balance": self.accounts[account]['balance']
-            }
-            
+    # -- helpers
+    @staticmethod
+    def parse_amount(raw) -> Decimal:
+        if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+            raise ValueError("金額格式錯誤")
         try:
-            if amount <= 0:
-                raise ValueError("轉帳金額需大於零")
-                
-            if self.accounts[account]['balance'] >= amount:
-                self.accounts[account]['balance'] -= amount
-                self.accounts[target]['balance'] += amount
-                return {
-                    "success": True,
-                    "balance": self.accounts[account]['balance'],
-                    "message": f"成功轉賬 {amount:.2f} 元至 {target}"
-                }
+            amount = Decimal(str(raw))
+        except InvalidOperation:
+            raise ValueError("金額格式錯誤") from None
+        if not amount.is_finite():
+            raise ValueError("金額格式錯誤")
+        if amount <= 0:
+            raise ValueError("金額需大於零")
+        if amount > MAX_TX_AMOUNT:  # 先檢查範圍，避免極大指數讓 quantize 出錯
+            raise ValueError(f"單筆金額上限為 {MAX_TX_AMOUNT:,} 元")
+        if amount != amount.quantize(CENT):
+            raise ValueError("金額最多到小數點後兩位")
+        return amount.quantize(CENT)
+
+    @staticmethod
+    def _ok(acct: Account, message: str) -> dict:
+        return {"success": True, "balance": f"{acct.balance:.2f}", "message": message}
+
+    @staticmethod
+    def _fail(acct: Account | None, message: str) -> dict:
+        resp = {"success": False, "message": message}
+        if acct is not None:
+            resp["balance"] = f"{acct.balance:.2f}"
+        return resp
+
+    # -- auth
+    def login(self, number, pin) -> tuple[Account | None, dict]:
+        acct = self.accounts.get(number) if isinstance(number, str) else None
+        if acct is None or not isinstance(pin, str):
+            # 不透露帳號是否存在
+            return None, self._fail(None, "帳號或 PIN 錯誤")
+        with acct.lock:
+            if acct.failed_attempts >= MAX_PIN_ATTEMPTS:
+                return None, self._fail(None, "帳戶已鎖定，請洽臨櫃")
+            if not acct.check_pin(pin):
+                acct.failed_attempts += 1
+                left = MAX_PIN_ATTEMPTS - acct.failed_attempts
+                return None, self._fail(None, f"帳號或 PIN 錯誤（剩餘 {left} 次）")
+            acct.failed_attempts = 0
+            return acct, self._ok(acct, "登入成功")
+
+    # -- transactions
+    def balance(self, acct: Account) -> dict:
+        with acct.lock:
+            return self._ok(acct, "餘額查詢成功")
+
+    def deposit(self, acct: Account, amount: Decimal) -> dict:
+        with acct.lock:
+            acct.balance += amount
+            return self._ok(acct, f"成功存入 {amount:,.2f} 元")
+
+    def withdraw(self, acct: Account, amount: Decimal) -> dict:
+        with acct.lock:
+            if acct.balance < amount:
+                return self._fail(acct, "餘額不足")
+            acct.balance -= amount
+            return self._ok(acct, f"成功取出 {amount:,.2f} 元")
+
+    def transfer(self, src: Account, target_no, amount: Decimal) -> dict:
+        target = self.accounts.get(target_no) if isinstance(target_no, str) else None
+        if target is None:
+            with src.lock:
+                return self._fail(src, "目標帳號不存在")
+        if target is src:
+            with src.lock:
+                return self._fail(src, "不可轉帳給自己")
+        # 依帳號排序取鎖，避免兩筆反向轉帳互相死結
+        first, second = sorted((src, target), key=lambda a: a.number)
+        with first.lock, second.lock:
+            if src.balance < amount:
+                return self._fail(src, "餘額不足")
+            src.balance -= amount
+            target.balance += amount
+            return self._ok(src, f"成功轉帳 {amount:,.2f} 元至 {target.number}")
+
+
+# ---------------------------------------------------------------- session
+class Session:
+    def __init__(self, bank: Bank, channel: SecureChannel, peer: str):
+        self.bank = bank
+        self.channel = channel
+        self.peer = peer
+        self.account: Account | None = None
+
+    def run(self) -> None:
+        while True:
+            try:
+                req = self.channel.recv()
+            except ConnectionError:
+                return
+            resp = self.handle(req)
+            self.channel.send(resp)
+
+    def handle(self, req: dict) -> dict:
+        req_type = req.get("type")
+        if req_type == "login":
+            acct, resp = self.bank.login(req.get("account"), req.get("pin"))
+            self.account = acct
+            log.info("%s login %s -> %s", self.peer, req.get("account"), resp["message"])
+            return resp
+        if req_type == "logout":
+            self.account = None
+            return {"success": True, "message": "已登出"}
+
+        if self.account is None:
+            return Bank._fail(None, "請先登入")
+        acct = self.account
+
+        try:
+            if req_type == "balance":
+                resp = self.bank.balance(acct)
+            elif req_type == "deposit":
+                resp = self.bank.deposit(acct, Bank.parse_amount(req.get("amount")))
+            elif req_type == "withdraw":
+                resp = self.bank.withdraw(acct, Bank.parse_amount(req.get("amount")))
+            elif req_type == "transfer":
+                resp = self.bank.transfer(
+                    acct, req.get("target"), Bank.parse_amount(req.get("amount"))
+                )
             else:
-                return {
-                    "success": False,
-                    "message": "餘額不足",
-                    "balance": self.accounts[account]['balance']
-                }
+                resp = Bank._fail(acct, "無效操作類型")
         except ValueError as e:
-            return {
-                "success": False,
-                "message": f"無效操作: {str(e)}",
-                "balance": self.accounts[account]['balance']
-            }
+            resp = Bank._fail(acct, str(e))
+        except Exception:  # noqa: BLE001 — 任何非預期錯誤都不應讓連線崩潰或洩漏內部資訊
+            log.exception("%s 處理請求時發生未預期錯誤", self.peer)
+            resp = Bank._fail(acct, "伺服器內部錯誤")
+        log.info("%s [%s] %s -> %s", self.peer, acct.number, req_type, resp["message"])
+        return resp
 
-    def _handle_balance(self, account):
-        return {
-            "success": True,
-            "balance": self.accounts[account]['balance'],
-            "message": "餘額查詢成功"
-        }
 
-    def _quantum_decrypt(self, payload, session_key, conn):
-        if len(payload) < 28:
-            raise ValueError("封包長度不足28字節")
-        
-        nonce = payload[:12]
-        tag = payload[12:28]
-        ciphertext = payload[28:]
-        
-        key = HKDF(
-            algorithm=hashes.SHA384(),
-            length=32,
-            salt=None,
-            info=b'quantum-banking'
-        ).derive(session_key)
+class BankRequestHandler(socketserver.BaseRequestHandler):
+    server: "QuantumBankServer"
 
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-        data = json.loads(plaintext.decode())
-        
-        session_data = self.active_sessions[conn]
-        if not Dilithium2.verify(
-            session_data['sig_pk'],
-            json.dumps(data['data']).encode(),
-            bytes.fromhex(data['sig'])
-        ):
-            raise ValueError("量子簽章驗證失敗")
-        return data['data']
+    def handle(self) -> None:
+        peer = "%s:%d" % self.client_address[:2]
+        sock: socket.socket = self.request
+        sock.settimeout(IDLE_TIMEOUT)
+        try:
+            t0 = time.perf_counter()
+            channel = server_handshake(sock, self.server.identity)
+            log.info("%s 量子安全通道建立（%.0f ms）", peer, (time.perf_counter() - t0) * 1000)
+            Session(self.server.bank, channel, peer).run()
+        except socket.timeout:
+            log.info("%s 閒置逾時，中斷連線", peer)
+        except (ProtocolError, ValueError) as e:
+            log.warning("%s 協定錯誤：%s", peer, e)
+        except (ConnectionError, OSError) as e:
+            log.info("%s 連線中斷：%s", peer, e)
+        finally:
+            log.info("%s 已斷線", peer)
 
-    def _send_response(self, conn, data, session_key):
-        nonce = get_random_bytes(12)
-        key = HKDF(
-            algorithm=hashes.SHA384(),
-            length=32,
-            salt=None,
-            info=b'quantum-banking'
-        ).derive(session_key)
-        
-        signature = Dilithium2.sign(self.server_sig_sk, json.dumps(data).encode())
-        payload = {
-            'data': data,
-            'sig': signature.hex(),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        ciphertext, tag = cipher.encrypt_and_digest(json.dumps(payload).encode())
-        full_payload = nonce + tag + ciphertext
-        conn.sendall(len(full_payload).to_bytes(4, 'big') + full_payload)
-        return full_payload
 
-    def _recv_all(self, conn, length):
-        data = bytearray()
-        while len(data) < length:
-            chunk = conn.recv(length - len(data))
-            if not chunk:
-                raise ConnectionAbortedError("連線非正常終止")
-            data.extend(chunk)
-        return bytes(data)
+class QuantumBankServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, addr, identity: ServerIdentity, bank: Bank | None = None):
+        self.identity = identity
+        self.bank = bank or Bank()
+        super().__init__(addr, BankRequestHandler)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="quantumATM 銀行核心伺服器")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--identity", default="server_identity.key",
+                        help="伺服器長期 ML-DSA 身分金鑰檔")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    identity = ServerIdentity.load_or_create(args.identity)
+    log.info("伺服器公鑰指紋：%s", fingerprint(identity.pk))
+
+    with QuantumBankServer((args.host, args.port), identity) as srv:
+        log.info("量子銀行核心系統啟動 @ %s:%d", args.host, args.port)
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            log.info("伺服器關閉")
+
 
 if __name__ == "__main__":
-    QuantumBankServer().start()
+    main()

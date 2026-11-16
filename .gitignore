@@ -1,0 +1,11 @@
+# 金鑰與執行期資料
+server_identity.key
+known_servers.json
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -63,6 +63,7 @@ python -m unittest discover -v tests
 - `tests/test_gui.py`：用真正的 Tkinter 視窗跑完整流程（首次連線確認指紋 → 登入 → 存款／取款／轉帳 →
   登出再登入、PIN 錯誤重試、伺服器換金鑰被拒、連線中斷後回到登入畫面）。
   沒有 Tkinter 或顯示器時會自動略過；無桌面的 Linux 可用 `xvfb-run python -m unittest discover -v tests`。
+- `tests/test_architecture.py`：檢查模組依賴方向與檔案大小上限（規則見 AGENTS.md）。
 
 ## 安全機制
 | 技術 | 實現目標 |
@@ -76,11 +77,16 @@ python -m unittest discover -v tests
 
 ## 專案結構
 ```
-protocol.py        共用握手與加密通道
-server_mlkem.py    銀行伺服器（帳務邏輯、登入、交易）
-client_mlkem.py    ATM 客戶端（ATMSession 協定核心 + Tkinter GUI）
-tests/             端到端測試與 GUI 流程測試
+wire.py            訊息契約（請求／回應格式、金額規則）
+protocol.py        握手與加密通道
+bank.py            帳務邏輯
+server_mlkem.py    銀行伺服器（網路層、請求分派）
+atm_client.py      客戶端核心（連線、公鑰釘選、輸入解析）
+client_mlkem.py    ATM 畫面（Tkinter）
+tests/             端到端、GUI 流程與架構規則測試
 ```
+要修改或擴充這個專案（不論是人或 AI 模型），請先讀 [AGENTS.md](AGENTS.md)：裡面有模組分工、
+依賴規則、「改什麼只需要讀哪些檔」的對照表與更新流程。
 
 ## 未來擴展
 - [ ] 帳戶資料持久化（SQLite）與交易日誌

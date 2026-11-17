@@ -1,26 +1,22 @@
 """
-quantumATM 銀行核心伺服器
+quantumATM 銀行核心伺服器（網路層 + 請求分派）
 
     python server_mlkem.py [--host 0.0.0.0] [--port 5000]
 
 第一次啟動會產生長期 ML-DSA-65 身分金鑰 server_identity.key（請勿上傳 Git），
-並印出公鑰指紋，供 ATM 端比對。
+並印出公鑰指紋，供 ATM 端比對。帳務邏輯在 bank.py，訊息格式在 wire.py。
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import logging
-import math
-import os
 import socket
 import socketserver
 import threading
 import time
-from decimal import Decimal, InvalidOperation
 
+from bank import Bank, Result
 from protocol import (
     DEFAULT_PORT,
     ProtocolError,
@@ -29,140 +25,23 @@ from protocol import (
     fingerprint,
     server_handshake,
 )
+from wire import parse_amount, reply
 
 log = logging.getLogger("quantum-bank")
 
-CENT = Decimal("0.01")
-MAX_TX_AMOUNT = Decimal("1000000")   # 單筆上限
-MAX_PIN_ATTEMPTS = 3
-PIN_LOCKOUT_SECONDS = 300            # 連續輸錯後的鎖定時間
-MAX_PIN_LENGTH = 12
-HANDSHAKE_TIMEOUT = 10               # 秒；握手必須在這段時間內完成
-IDLE_TIMEOUT = 120                   # 秒；閒置連線自動斷開
-MAX_CONNECTIONS = 64                 # 同時連線上限（握手運算成本高，避免被灌爆）
+HANDSHAKE_TIMEOUT = 10  # 秒；握手必須在這段時間內完成
+IDLE_TIMEOUT = 120      # 秒；閒置連線自動斷開
+MAX_CONNECTIONS = 64    # 同時連線上限（握手運算成本高，避免被灌爆）
+
+# 登入後可用的操作：type → (bank, 帳戶, 請求) → bank.Result。新增交易類型只要在這裡加一行。
+HANDLERS = {
+    "balance": lambda bank, acct, req: bank.balance(acct),
+    "deposit": lambda bank, acct, req: bank.deposit(acct, parse_amount(req.get("amount"))),
+    "withdraw": lambda bank, acct, req: bank.withdraw(acct, parse_amount(req.get("amount"))),
+    "transfer": lambda bank, acct, req: bank.transfer(acct, req.get("target"), parse_amount(req.get("amount"))),
+}
 
 
-# ---------------------------------------------------------------- bank state
-def _hash_pin(pin: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(pin.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
-
-
-class Account:
-    def __init__(self, number: str, balance: str, pin: str):
-        self.number = number
-        self.balance = Decimal(balance)
-        self.salt = os.urandom(16)
-        self.pin_hash = _hash_pin(pin, self.salt)
-        self.failed_attempts = 0
-        self.locked_until = 0.0  # time.monotonic() 時間點
-        self.lock = threading.Lock()
-
-    def check_pin(self, pin: str) -> bool:
-        return hmac.compare_digest(_hash_pin(pin, self.salt), self.pin_hash)
-
-
-class Bank:
-    """所有帳務操作都在帳戶鎖內完成，避免多執行緒競爭造成餘額錯誤。"""
-
-    def __init__(self, lockout_seconds: float = PIN_LOCKOUT_SECONDS):
-        self.lockout_seconds = lockout_seconds
-        # 示範帳戶（帳號, 初始餘額, PIN）
-        self.accounts = {
-            a.number: a
-            for a in (
-                Account("1001", "100000.00", "1234"),
-                Account("1002", "50000.00", "5678"),
-            )
-        }
-
-    # -- helpers
-    @staticmethod
-    def parse_amount(raw) -> Decimal:
-        if isinstance(raw, bool) or not isinstance(raw, (str, int)):
-            raise ValueError("金額格式錯誤")
-        try:
-            amount = Decimal(str(raw))
-        except InvalidOperation:
-            raise ValueError("金額格式錯誤") from None
-        if not amount.is_finite():
-            raise ValueError("金額格式錯誤")
-        if amount <= 0:
-            raise ValueError("金額需大於零")
-        if amount > MAX_TX_AMOUNT:  # 先檢查範圍，避免極大指數讓 quantize 出錯
-            raise ValueError(f"單筆金額上限為 {MAX_TX_AMOUNT:,} 元")
-        if amount != amount.quantize(CENT):
-            raise ValueError("金額最多到小數點後兩位")
-        return amount.quantize(CENT)
-
-    @staticmethod
-    def _ok(acct: Account, message: str) -> dict:
-        return {"success": True, "balance": f"{acct.balance:.2f}", "message": message}
-
-    @staticmethod
-    def _fail(acct: Account | None, message: str) -> dict:
-        resp = {"success": False, "message": message}
-        if acct is not None:
-            resp["balance"] = f"{acct.balance:.2f}"
-        return resp
-
-    # -- auth
-    def login(self, number, pin) -> tuple[Account | None, dict]:
-        acct = self.accounts.get(number) if isinstance(number, str) else None
-        if acct is None or not isinstance(pin, str) or not 0 < len(pin) <= MAX_PIN_LENGTH:
-            return None, self._fail(None, "帳號或 PIN 錯誤")
-        with acct.lock:
-            remaining = acct.locked_until - time.monotonic()
-            if remaining > 0:
-                return None, self._fail(None, f"帳戶已鎖定，請於 {math.ceil(remaining)} 秒後再試")
-            if not acct.check_pin(pin):
-                acct.failed_attempts += 1
-                left = MAX_PIN_ATTEMPTS - acct.failed_attempts
-                if left > 0:
-                    return None, self._fail(None, f"帳號或 PIN 錯誤（剩餘 {left} 次）")
-                # 限時鎖定而非永久鎖定：擋得住暴力猜 PIN，又不會讓任何人都能把帳戶永久鎖死
-                acct.failed_attempts = 0
-                acct.locked_until = time.monotonic() + self.lockout_seconds
-                return None, self._fail(
-                    None, f"PIN 連續錯誤 {MAX_PIN_ATTEMPTS} 次，帳戶已鎖定 {math.ceil(self.lockout_seconds)} 秒")
-            acct.failed_attempts = 0
-            return acct, self._ok(acct, "登入成功")
-
-    # -- transactions
-    def balance(self, acct: Account) -> dict:
-        with acct.lock:
-            return self._ok(acct, "餘額查詢成功")
-
-    def deposit(self, acct: Account, amount: Decimal) -> dict:
-        with acct.lock:
-            acct.balance += amount
-            return self._ok(acct, f"成功存入 {amount:,.2f} 元")
-
-    def withdraw(self, acct: Account, amount: Decimal) -> dict:
-        with acct.lock:
-            if acct.balance < amount:
-                return self._fail(acct, "餘額不足")
-            acct.balance -= amount
-            return self._ok(acct, f"成功取出 {amount:,.2f} 元")
-
-    def transfer(self, src: Account, target_no, amount: Decimal) -> dict:
-        target = self.accounts.get(target_no) if isinstance(target_no, str) else None
-        if target is None:
-            with src.lock:
-                return self._fail(src, "目標帳號不存在")
-        if target is src:
-            with src.lock:
-                return self._fail(src, "不可轉帳給自己")
-        # 依帳號排序取鎖，避免兩筆反向轉帳互相死結
-        first, second = sorted((src, target), key=lambda a: a.number)
-        with first.lock, second.lock:
-            if src.balance < amount:
-                return self._fail(src, "餘額不足")
-            src.balance -= amount
-            target.balance += amount
-            return self._ok(src, f"成功轉帳 {amount:,.2f} 元至 {target.number}")
-
-
-# ---------------------------------------------------------------- session
 def _clip(value, limit: int = 32) -> str:
     """客戶端送來的值寫進日誌前先轉成 repr 並截短，避免偽造日誌行或灌爆日誌。"""
     text = repr(value)
@@ -170,11 +49,13 @@ def _clip(value, limit: int = 32) -> str:
 
 
 class Session:
+    """一條連線的狀態：目前登入的帳戶。"""
+
     def __init__(self, bank: Bank, channel: SecureChannel, peer: str):
         self.bank = bank
         self.channel = channel
         self.peer = peer
-        self.account: Account | None = None
+        self.account = None
 
     def run(self) -> None:
         while True:
@@ -182,44 +63,31 @@ class Session:
                 req = self.channel.recv()
             except ConnectionError:
                 return
-            resp = self.handle(req)
-            self.channel.send(resp)
+            self.channel.send(reply(*self.handle(req)))
 
-    def handle(self, req: dict) -> dict:
-        req_type = req.get("type")
-        if req_type == "login":
-            acct, resp = self.bank.login(req.get("account"), req.get("pin"))
-            self.account = acct
-            log.info("%s login %s -> %s", self.peer, _clip(req.get("account")), resp["message"])
-            return resp
-        if req_type == "logout":
+    def handle(self, req: dict) -> Result:
+        kind = req.get("type")
+        if kind == "login":
+            self.account, result = self.bank.login(req.get("account"), req.get("pin"))
+            log.info("%s login %s -> %s", self.peer, _clip(req.get("account")), result.message)
+            return result
+        if kind == "logout":
             self.account = None
-            return {"success": True, "message": "已登出"}
-
+            return Result(True, "已登出")
         if self.account is None:
-            return Bank._fail(None, "請先登入")
-        acct = self.account
+            return Result(False, "請先登入")
 
+        acct = self.account
+        handler = HANDLERS.get(kind) if isinstance(kind, str) else None
         try:
-            if req_type == "balance":
-                resp = self.bank.balance(acct)
-            elif req_type == "deposit":
-                resp = self.bank.deposit(acct, Bank.parse_amount(req.get("amount")))
-            elif req_type == "withdraw":
-                resp = self.bank.withdraw(acct, Bank.parse_amount(req.get("amount")))
-            elif req_type == "transfer":
-                resp = self.bank.transfer(
-                    acct, req.get("target"), Bank.parse_amount(req.get("amount"))
-                )
-            else:
-                resp = Bank._fail(acct, "無效操作類型")
-        except ValueError as e:
-            resp = Bank._fail(acct, str(e))
+            result = handler(self.bank, acct, req) if handler else Bank.reject(acct, "無效操作類型")
+        except ValueError as e:  # 輸入不合法；訊息可直接給使用者
+            result = Bank.reject(acct, str(e))
         except Exception:  # noqa: BLE001 — 任何非預期錯誤都不應讓連線崩潰或洩漏內部資訊
             log.exception("%s 處理請求時發生未預期錯誤", self.peer)
-            resp = Bank._fail(acct, "伺服器內部錯誤")
-        log.info("%s [%s] %s -> %s", self.peer, acct.number, _clip(req_type), resp["message"])
-        return resp
+            result = Bank.reject(acct, "伺服器內部錯誤")
+        log.info("%s [%s] %s -> %s", self.peer, acct.number, _clip(kind), result.message)
+        return result
 
 
 class BankRequestHandler(socketserver.BaseRequestHandler):

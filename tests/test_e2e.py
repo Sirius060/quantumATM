@@ -4,12 +4,13 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from client_mlkem import ATMSession, KnownServers  # noqa: E402
-from protocol import ServerIdentity, client_handshake, recv_frame, send_frame  # noqa: E402
+from protocol import ProtocolError, ServerIdentity, client_handshake, recv_frame, send_frame  # noqa: E402
 from server_mlkem import QuantumBankServer  # noqa: E402
 
 
@@ -137,6 +138,80 @@ class E2ETest(unittest.TestCase):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(total(), before)
+
+    def test_pin_lockout_expires(self):
+        from server_mlkem import Bank
+        bank = Bank(lockout_seconds=0.3)
+        for _ in range(3):
+            self.assertIsNone(bank.login("1001", "0000")[0])
+        self.assertIsNone(bank.login("1001", "1234")[0])
+        time.sleep(0.4)
+        self.assertIsNotNone(bank.login("1001", "1234")[0])
+        # 過長或空的 PIN 直接拒絕，不會消耗嘗試次數
+        self.assertIsNone(bank.login("1002", "9" * 5000)[0])
+        self.assertIsNone(bank.login("1002", "")[0])
+        self.assertEqual(bank.accounts["1002"].failed_attempts, 0)
+
+    def test_server_input_parsing(self):
+        from client_mlkem import parse_server_input
+        from protocol import DEFAULT_PORT
+        self.assertEqual(parse_server_input(" localhost "), ("localhost", DEFAULT_PORT))
+        self.assertEqual(parse_server_input("192.168.1.5:6000"), ("192.168.1.5", 6000))
+        self.assertEqual(parse_server_input("[::1]:6000"), ("::1", 6000))
+        self.assertEqual(parse_server_input("::1"), ("::1", DEFAULT_PORT))
+        for bad in ["", ":5000", "host:abc", "host:0", "host:70000"]:
+            with self.assertRaises(ValueError):
+                parse_server_input(bad)
+
+    def test_corrupt_identity_file_is_reported(self):
+        from protocol import ProtocolError
+        path = os.path.join(self.tmp, "broken.key")
+        with open(path, "wb") as f:
+            f.write(b"not a key")
+        with self.assertRaises(ProtocolError):
+            ServerIdentity.load_or_create(path)
+
+
+class ServerLimitsTest(unittest.TestCase):
+    """握手逾時與連線數上限。"""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        identity = ServerIdentity.load_or_create(os.path.join(tmp, "id.key"))
+        self.srv = QuantumBankServer(("127.0.0.1", 0), identity,
+                                     max_connections=2, handshake_timeout=0.5)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_silent_client_is_dropped(self):
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        t0 = time.monotonic()
+        self.assertEqual(sock.recv(1), b"")  # 沒送 HELLO → 伺服器主動斷線
+        self.assertLess(time.monotonic() - t0, 3)
+        sock.close()
+
+    def test_connection_limit_and_slot_release(self):
+        a, b = ATMSession(), ATMSession()
+        a.connect("127.0.0.1", self.port)
+        b.connect("127.0.0.1", self.port)
+        c = ATMSession()
+        with self.assertRaises((OSError, ProtocolError)):
+            c.connect("127.0.0.1", self.port)
+        a.close()
+        for _ in range(50):  # 等伺服器釋放名額
+            try:
+                c.connect("127.0.0.1", self.port)
+                break
+            except (OSError, ProtocolError):
+                time.sleep(0.1)
+        self.assertTrue(c.connected)
+        self.assertTrue(c.request({"type": "login", "account": "1001", "pin": "1234"})["success"])
+        b.close()
+        c.close()
 
 
 if __name__ == "__main__":

@@ -1,30 +1,27 @@
 """GUI 流程測試：用真正的 Tkinter 視窗操作客戶端，對接一台測試伺服器。
 
 沒有 Tkinter 或沒有顯示器（例如無桌面的 Linux）時會自動略過；
-在那種環境可以用 `xvfb-run python -m unittest discover tests` 執行。
+在那種環境可以用 `xvfb-run python -m unittest discover -v tests` 執行。
 """
 import gc
 import os
-import sys
 import tempfile
 import threading
 import time
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from protocol import ServerIdentity
+from server_mlkem import QuantumBankServer
 
 try:
     import tkinter as tk
     from tkinter import messagebox, ttk
-    _probe = tk.Tk()
-    _probe.destroy()
+
+    from client_mlkem import create_app
+    tk.Tk().destroy()
     HAVE_TK = True
 except Exception:  # noqa: BLE001 — 沒有 tkinter 或沒有顯示器
     HAVE_TK = False
-
-from client_mlkem import create_app  # noqa: E402
-from protocol import ServerIdentity  # noqa: E402
-from server_mlkem import QuantumBankServer  # noqa: E402
 
 
 @unittest.skipUnless(HAVE_TK, "需要 Tkinter 與顯示器")
@@ -197,7 +194,7 @@ class GuiFlowTest(unittest.TestCase):
     def test_server_drop_returns_to_login_screen(self):
         app = self.app
         self.login()
-        app.session.channel.sock.close()  # 模擬連線中斷
+        app.session.channel.close()  # 模擬連線中斷
         self.button("查詢餘額").invoke()
         self.pump(lambda: not app.busy and app.connect_frame.winfo_ismapped(), what="回到登入畫面")
         self.assertEqual(self.dialogs[-1][:2], ("error", "連線中斷"))

@@ -46,6 +46,7 @@ SIG = ML_DSA_65
 EK_LEN = 1184          # ML-KEM-768 封裝公鑰
 CT_LEN = 1088          # ML-KEM-768 密文
 SIG_PK_LEN = 1952      # ML-DSA-65 公鑰
+SIG_SK_LEN = 4032      # ML-DSA-65 私鑰
 SIG_LEN = 3309         # ML-DSA-65 簽章
 NONCE_LEN = 32
 
@@ -111,6 +112,8 @@ class ServerIdentity:
         if os.path.exists(path):
             with open(path, "rb") as f:
                 blob = f.read()
+            if len(blob) != SIG_PK_LEN + SIG_SK_LEN:
+                raise ProtocolError(f"身分金鑰檔 {path} 已損毀（長度不符），請刪除後重新產生")
             pk, sk = blob[:SIG_PK_LEN], blob[SIG_PK_LEN:]
         else:
             pk, sk = SIG.keygen()

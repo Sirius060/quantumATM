@@ -103,15 +103,37 @@ def parse_amount_input(text: str) -> str:
     return f"{amount:.2f}"  # 以字串傳輸，避免浮點誤差
 
 
+def parse_server_input(text: str) -> tuple[str, int]:
+    """接受 `host` 或 `host:port`，回傳 (host, port)。"""
+    text = text.strip()
+    if text.startswith("["):  # [IPv6] 或 [IPv6]:port
+        host, _, rest = text[1:].partition("]")
+        if rest and not rest.startswith(":"):
+            raise ValueError("伺服器位址格式錯誤")
+        port_text = rest[1:]
+    elif text.count(":") == 1:
+        host, port_text = text.split(":")
+    else:  # 純主機名稱，或未加括號的 IPv6 位址
+        host, port_text = text, ""
+    if not host:
+        raise ValueError("請輸入伺服器位址")
+    if not port_text:
+        return host, DEFAULT_PORT
+    if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+        raise ValueError("埠號需為 1–65535 的數字")
+    return host, int(port_text)
+
+
 # ================================================================ GUI
-def run_gui() -> None:
+def create_app(known_servers_path: str = KNOWN_SERVERS_FILE):
+    """建立 GUI 但不進入主迴圈（測試可以直接操作回傳的物件）。"""
     import tkinter as tk
     from tkinter import messagebox, ttk
 
     class QuantumATMClient:
         def __init__(self):
             self.session = ATMSession()
-            self.known = KnownServers()
+            self.known = KnownServers(known_servers_path)
             self.account_no = ""
             self.busy = False
             self._ui_queue: "queue.Queue" = queue.Queue()
@@ -131,21 +153,31 @@ def run_gui() -> None:
                 return
             self._set_busy(True)
 
+            def finish(callback, value):
+                # 先解除忙碌狀態再呼叫回呼，回呼裡才能接著啟動下一個背景工作
+                # （例如握手完成後接著登入）。
+                self._set_busy(False)
+                callback(value)
+
             def runner():
                 try:
                     result = work()
-                    self._ui_queue.put(lambda: on_done(result))
                 except Exception as e:  # noqa: BLE001
-                    self._ui_queue.put(lambda e=e: (on_error or self._on_request_error)(e))
-                finally:
-                    self._ui_queue.put(lambda: self._set_busy(False))
+                    self._ui_queue.put(lambda e=e: finish(on_error or self._on_request_error, e))
+                else:
+                    self._ui_queue.put(lambda: finish(on_done, result))
 
             threading.Thread(target=runner, daemon=True).start()
 
         def _poll_ui_queue(self):
             try:
                 while True:
-                    self._ui_queue.get_nowait()()
+                    callback = self._ui_queue.get_nowait()
+                    try:
+                        callback()
+                    except Exception as e:  # noqa: BLE001 — 單一回呼出錯不能讓輪詢停掉
+                        self._set_busy(False)
+                        self._log(f"介面更新錯誤：{e}", "error")
             except queue.Empty:
                 pass
             self.root.after(50, self._poll_ui_queue)
@@ -170,7 +202,7 @@ def run_gui() -> None:
             main = ttk.Frame(self.root)
             main.pack(fill="both", expand=True, padx=20, pady=20)
 
-            title = ttk.Frame(main)
+            title = self.title_frame = ttk.Frame(main)
             title.pack(fill="x", pady=(0, 20))
             ttk.Label(title, text="🛡️ 量子安全ATM系統", style="Title.TLabel").pack()
             ttk.Label(title, text="ML-KEM-768 · ML-DSA-65 · AES-256-GCM",
@@ -181,7 +213,7 @@ def run_gui() -> None:
             self.connect_frame.pack(fill="x", pady=(0, 20))
             grid = ttk.Frame(self.connect_frame)
             grid.pack()
-            fields = [("伺服器IP:", "localhost", ""), ("帳號:", "1001", ""), ("PIN:", "", "•")]
+            fields = [("伺服器:", "localhost", ""), ("帳號:", "1001", ""), ("PIN:", "", "•")]
             self.ip_entry, self.acct_entry, self.pin_entry = (
                 self._labeled_entry(grid, r, label, default, show)
                 for r, (label, default, show) in enumerate(fields)
@@ -251,15 +283,20 @@ def run_gui() -> None:
 
         # ---------------- connect / login
         def _start_connect(self):
-            host = self.ip_entry.get().strip()
+            if self.busy:
+                return
             acct = self.acct_entry.get().strip()
             pin = self.pin_entry.get()
-            if not host or not acct or not pin:
-                messagebox.showerror("輸入錯誤", "請輸入伺服器、帳號與 PIN")
+            try:
+                host, port = parse_server_input(self.ip_entry.get())
+                if not acct or not pin:
+                    raise ValueError("請輸入帳號與 PIN")
+            except ValueError as err:
+                messagebox.showerror("輸入錯誤", str(err))
                 return
             self.connect_btn.configure(text="🔄 連線中...")
             self._update_status("🟡 正在建立量子安全通道...")
-            server_id = f"{host}:{DEFAULT_PORT}"
+            server_id = f"{host}:{port}"
 
             def done(pk):
                 verdict = self.known.check(server_id, pk)
@@ -267,7 +304,7 @@ def run_gui() -> None:
                     self.session.close()
                     self._connect_failed(
                         "⚠️ 伺服器公鑰與先前記錄不符，可能遭中間人攻擊！\n"
-                        f"指紋：{fingerprint(pk)}\n若伺服器確實更換金鑰，請刪除 {KNOWN_SERVERS_FILE} 中的對應項目。")
+                        f"指紋：{fingerprint(pk)}\n若伺服器確實更換金鑰，請刪除 {self.known.path} 中的對應項目。")
                     return
                 if verdict == "new":
                     ok = messagebox.askyesno(
@@ -281,7 +318,7 @@ def run_gui() -> None:
                     self.known.trust(server_id, pk)
                 self._login(acct, pin)
 
-            self._run_bg(lambda: self.session.connect(host), done,
+            self._run_bg(lambda: self.session.connect(host, port), done,
                          lambda e: self._connect_failed(str(e)))
 
         def _login(self, acct, pin):
@@ -292,6 +329,7 @@ def run_gui() -> None:
                     return
                 self.account_no = acct
                 self.pin_entry.delete(0, "end")
+                self.connect_btn.configure(text="🔐 建立量子安全連線")
                 self.connect_frame.pack_forget()
                 self.main_frame.pack(fill="both", expand=True)
                 self.account_var.set(f"帳號 {acct}")
@@ -308,14 +346,20 @@ def run_gui() -> None:
             self._update_status("🔴 連線失敗")
             messagebox.showerror("連線失敗", f"錯誤原因：{error}")
 
+        def _show_login_screen(self, status):
+            """回到連線／登入畫面（登出或連線中斷時）。"""
+            self.session.close()
+            self.account_no = ""
+            self.main_frame.pack_forget()
+            self.connect_frame.pack(fill="x", pady=(0, 20), after=self.title_frame)
+            self.connect_btn.configure(text="🔐 建立量子安全連線")
+            self.account_var.set("")
+            self.balance_var.set("--")
+            self._update_status(status)
+
         def _logout(self):
             def finish(_=None):
-                self.session.close()
-                self.main_frame.pack_forget()
-                self.connect_frame.pack(fill="x", pady=(0, 20), before=self.main_frame)
-                self.connect_btn.configure(text="🔐 建立量子安全連線")
-                self.balance_var.set("--")
-                self._update_status("🔴 已登出")
+                self._show_login_screen("🔴 已登出")
 
             self._run_bg(lambda: self.session.request({"type": "logout"}), finish, finish)
 
@@ -346,17 +390,13 @@ def run_gui() -> None:
         def _on_request_error(self, e):
             self._log(f"通訊錯誤：{e}", "error")
             if not self.session.connected:
-                self._update_status("🔴 連線中斷 - 請重新登入")
+                self._show_login_screen("🔴 連線中斷 - 請重新登入")
                 messagebox.showerror("連線中斷", f"{e}\n\n安全通道已關閉，請重新登入。")
-                self.main_frame.pack_forget()
-                self.connect_frame.pack(fill="x", pady=(0, 20), before=self.main_frame)
-                self.connect_btn.configure(text="🔐 建立量子安全連線")
 
         def _dialog(self, title, fields, on_ok):
             dlg = tk.Toplevel(self.root)
             dlg.title(title)
             dlg.transient(self.root)
-            dlg.grab_set()
             dlg.resizable(False, False)
             frm = ttk.Frame(dlg, padding=15)
             frm.pack()
@@ -366,6 +406,8 @@ def run_gui() -> None:
                 e = ttk.Entry(frm, width=20)
                 e.grid(row=r, column=1, pady=5)
                 entries.append(e)
+            dlg.wait_visibility()  # 視窗顯示後才能 grab，否則部分平台會報錯
+            dlg.grab_set()
             entries[0].focus_set()
 
             def confirm(_e=None):
@@ -423,7 +465,11 @@ def run_gui() -> None:
             self.session.close()
             self.root.destroy()
 
-    QuantumATMClient().root.mainloop()
+    return QuantumATMClient()
+
+
+def run_gui() -> None:
+    create_app().root.mainloop()
 
 
 if __name__ == "__main__":

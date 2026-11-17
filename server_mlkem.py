@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import hmac
 import logging
+import math
 import os
 import socket
 import socketserver
@@ -34,7 +35,11 @@ log = logging.getLogger("quantum-bank")
 CENT = Decimal("0.01")
 MAX_TX_AMOUNT = Decimal("1000000")   # 單筆上限
 MAX_PIN_ATTEMPTS = 3
+PIN_LOCKOUT_SECONDS = 300            # 連續輸錯後的鎖定時間
+MAX_PIN_LENGTH = 12
+HANDSHAKE_TIMEOUT = 10               # 秒；握手必須在這段時間內完成
 IDLE_TIMEOUT = 120                   # 秒；閒置連線自動斷開
+MAX_CONNECTIONS = 64                 # 同時連線上限（握手運算成本高，避免被灌爆）
 
 
 # ---------------------------------------------------------------- bank state
@@ -49,6 +54,7 @@ class Account:
         self.salt = os.urandom(16)
         self.pin_hash = _hash_pin(pin, self.salt)
         self.failed_attempts = 0
+        self.locked_until = 0.0  # time.monotonic() 時間點
         self.lock = threading.Lock()
 
     def check_pin(self, pin: str) -> bool:
@@ -58,7 +64,8 @@ class Account:
 class Bank:
     """所有帳務操作都在帳戶鎖內完成，避免多執行緒競爭造成餘額錯誤。"""
 
-    def __init__(self):
+    def __init__(self, lockout_seconds: float = PIN_LOCKOUT_SECONDS):
+        self.lockout_seconds = lockout_seconds
         # 示範帳戶（帳號, 初始餘額, PIN）
         self.accounts = {
             a.number: a
@@ -101,16 +108,22 @@ class Bank:
     # -- auth
     def login(self, number, pin) -> tuple[Account | None, dict]:
         acct = self.accounts.get(number) if isinstance(number, str) else None
-        if acct is None or not isinstance(pin, str):
-            # 不透露帳號是否存在
+        if acct is None or not isinstance(pin, str) or not 0 < len(pin) <= MAX_PIN_LENGTH:
             return None, self._fail(None, "帳號或 PIN 錯誤")
         with acct.lock:
-            if acct.failed_attempts >= MAX_PIN_ATTEMPTS:
-                return None, self._fail(None, "帳戶已鎖定，請洽臨櫃")
+            remaining = acct.locked_until - time.monotonic()
+            if remaining > 0:
+                return None, self._fail(None, f"帳戶已鎖定，請於 {math.ceil(remaining)} 秒後再試")
             if not acct.check_pin(pin):
                 acct.failed_attempts += 1
                 left = MAX_PIN_ATTEMPTS - acct.failed_attempts
-                return None, self._fail(None, f"帳號或 PIN 錯誤（剩餘 {left} 次）")
+                if left > 0:
+                    return None, self._fail(None, f"帳號或 PIN 錯誤（剩餘 {left} 次）")
+                # 限時鎖定而非永久鎖定：擋得住暴力猜 PIN，又不會讓任何人都能把帳戶永久鎖死
+                acct.failed_attempts = 0
+                acct.locked_until = time.monotonic() + self.lockout_seconds
+                return None, self._fail(
+                    None, f"PIN 連續錯誤 {MAX_PIN_ATTEMPTS} 次，帳戶已鎖定 {math.ceil(self.lockout_seconds)} 秒")
             acct.failed_attempts = 0
             return acct, self._ok(acct, "登入成功")
 
@@ -150,6 +163,12 @@ class Bank:
 
 
 # ---------------------------------------------------------------- session
+def _clip(value, limit: int = 32) -> str:
+    """客戶端送來的值寫進日誌前先轉成 repr 並截短，避免偽造日誌行或灌爆日誌。"""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 class Session:
     def __init__(self, bank: Bank, channel: SecureChannel, peer: str):
         self.bank = bank
@@ -171,7 +190,7 @@ class Session:
         if req_type == "login":
             acct, resp = self.bank.login(req.get("account"), req.get("pin"))
             self.account = acct
-            log.info("%s login %s -> %s", self.peer, req.get("account"), resp["message"])
+            log.info("%s login %s -> %s", self.peer, _clip(req.get("account")), resp["message"])
             return resp
         if req_type == "logout":
             self.account = None
@@ -199,7 +218,7 @@ class Session:
         except Exception:  # noqa: BLE001 — 任何非預期錯誤都不應讓連線崩潰或洩漏內部資訊
             log.exception("%s 處理請求時發生未預期錯誤", self.peer)
             resp = Bank._fail(acct, "伺服器內部錯誤")
-        log.info("%s [%s] %s -> %s", self.peer, acct.number, req_type, resp["message"])
+        log.info("%s [%s] %s -> %s", self.peer, acct.number, _clip(req_type), resp["message"])
         return resp
 
 
@@ -209,14 +228,15 @@ class BankRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         peer = "%s:%d" % self.client_address[:2]
         sock: socket.socket = self.request
-        sock.settimeout(IDLE_TIMEOUT)
         try:
+            sock.settimeout(self.server.handshake_timeout)
             t0 = time.perf_counter()
             channel = server_handshake(sock, self.server.identity)
             log.info("%s 量子安全通道建立（%.0f ms）", peer, (time.perf_counter() - t0) * 1000)
+            sock.settimeout(self.server.idle_timeout)
             Session(self.server.bank, channel, peer).run()
         except socket.timeout:
-            log.info("%s 閒置逾時，中斷連線", peer)
+            log.info("%s 逾時，中斷連線", peer)
         except (ProtocolError, ValueError) as e:
             log.warning("%s 協定錯誤：%s", peer, e)
         except (ConnectionError, OSError) as e:
@@ -229,10 +249,29 @@ class QuantumBankServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, identity: ServerIdentity, bank: Bank | None = None):
+    def __init__(self, addr, identity: ServerIdentity, bank: Bank | None = None, *,
+                 max_connections: int = MAX_CONNECTIONS,
+                 handshake_timeout: float = HANDSHAKE_TIMEOUT,
+                 idle_timeout: float = IDLE_TIMEOUT):
         self.identity = identity
         self.bank = bank or Bank()
+        self.handshake_timeout = handshake_timeout
+        self.idle_timeout = idle_timeout
+        self._slots = threading.BoundedSemaphore(max_connections)
         super().__init__(addr, BankRequestHandler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            log.warning("%s:%d 連線數已達上限，拒絕連線", *client_address[:2])
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def main() -> None:
